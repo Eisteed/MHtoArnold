@@ -1,0 +1,446 @@
+"""
+mh_extras_to_arnold.py
+======================
+Converts the 5 MetaHuman "extras" blinn shaders to aiStandardSurface:
+
+    - shader_eyeshell_shader        → cornea (transmissive dome over eyeball)
+    - shader_saliva_shader          → mouth saliva meniscus (water-like)
+    - shader_eyelashes_shader       → lashes (opacity-mapped cards)
+    - shader_eyelashesShadow_shader → fake contact shadow plane
+    - shader_eyeEdge_shader         → wet lacrimal rim (skin + spec)
+
+These are simpler than head/body — no wrinkle compositor, no anim maps,
+just attribute-level conversion with type-appropriate presets.
+
+USAGE
+-----
+    import mh_extras_to_arnold as mhx
+    mhx.convert_all()              # do all 5
+    mhx.convert_eyeshell()         # one at a time
+    mhx.revert_all()               # restore the blinns
+
+DESIGN
+------
+- The blinn shader is NOT deleted. Only the shadingEngine.surfaceShader is
+  rewired to the new Arnold node. revert_*() flips it back.
+- Each conversion preserves the blinn's static color and any incoming
+  texture connections (e.g. an alpha map on eyelashes' .transparency).
+- Cornea / saliva get hard-coded transmissive presets — those are what
+  makes the eyes/mouth look believable in render.
+"""
+
+import maya.cmds as cmds
+
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
+EXTRAS = {
+    "eyeshell":        {"src": "shader_eyeshell_shader",
+                        "ai":  "eyeshell_aiStandardSurface"},
+    "saliva":          {"src": "shader_saliva_shader",
+                        "ai":  "saliva_aiStandardSurface"},
+    "eyelashes":       {"src": "shader_eyelashes_shader",
+                        "ai":  "eyelashes_aiStandardSurface"},
+    "eyelashesShadow": {"src": "shader_eyelashesShadow_shader",
+                        "ai":  "eyelashesShadow_aiStandardSurface"},
+    "eyeEdge":         {"src": "shader_eyeEdge_shader",
+                        "ai":  "eyeEdge_aiStandardSurface"},
+}
+
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+def _ensure_arnold():
+    if not cmds.pluginInfo("mtoa", q=True, loaded=True):
+        cmds.loadPlugin("mtoa")
+
+
+def _resolve_src(part_key):
+    """Try the configured name, then variants (e.g. without `_shader` suffix).
+    Returns the actual node name if found, else None. Updates EXTRAS if a
+    variant matched."""
+    info = EXTRAS[part_key]
+    candidates = [info["src"]]
+    base = info["src"].replace("_shader", "")
+    for v in (base, base + "_shader"):
+        if v not in candidates:
+            candidates.append(v)
+    for name in candidates:
+        if cmds.objExists(name):
+            if name != info["src"]:
+                print("[mh-extras] Resolved '{}' (was '{}')".format(name, info["src"]))
+                info["src"] = name
+            return name
+    return None
+
+
+def _create(node_type, name, as_what="asShader"):
+    if cmds.objExists(name):
+        cmds.delete(name)
+    return cmds.shadingNode(node_type, **{as_what: True, "name": name})
+
+
+def _connect(src, dst, force=True):
+    cmds.connectAttr(src, dst, force=force)
+
+
+def _get_shadingengine(shader):
+    """Robust SG lookup: direct connection, then by Maya naming convention."""
+    sgs = cmds.listConnections(shader + ".outColor", type="shadingEngine") or []
+    if sgs:
+        return sgs[0]
+    sg = shader + "SG"
+    if cmds.objExists(sg) and cmds.nodeType(sg) == "shadingEngine":
+        return sg
+    sgs = cmds.listConnections(shader, type="shadingEngine") or []
+    return sgs[0] if sgs else None
+
+
+def _src_plug(node, attr):
+    """Return the source plug feeding node.attr, or None if it's a static value."""
+    if not cmds.objExists(node):
+        return None
+    if not cmds.attributeQuery(attr, node=node, exists=True):
+        return None
+    srcs = cmds.listConnections(node + "." + attr, s=True, d=False, p=True) or []
+    return srcs[0] if srcs else None
+
+
+def _get_color(node, attr, default=(1.0, 1.0, 1.0)):
+    """Read a color attr value (returns 3-tuple)."""
+    if not cmds.objExists(node) or not cmds.attributeQuery(attr, node=node, exists=True):
+        return default
+    try:
+        v = cmds.getAttr(node + "." + attr)
+        if isinstance(v, list) and v and isinstance(v[0], tuple):
+            return v[0]
+        if isinstance(v, (list, tuple)) and len(v) >= 3:
+            return tuple(v[:3])
+    except Exception:
+        pass
+    return default
+
+
+def _override_sg(src_blinn, ai_shader):
+    """Rewire the shadingEngine so it uses ai_shader instead of src_blinn."""
+    sg = _get_shadingengine(src_blinn)
+    if not sg:
+        cmds.warning("[mh-extras] No shadingEngine found for {}".format(src_blinn))
+        return
+    _connect(ai_shader + ".outColor", sg + ".surfaceShader")
+    print("[mh-extras] SG '{}' surfaceShader -> {}".format(sg, ai_shader))
+
+
+def _restore_sg(src_blinn):
+    """Reconnect the original blinn to its shadingEngine.surfaceShader."""
+    sg = _get_shadingengine(src_blinn)
+    if not sg:
+        # The Arnold shader might be the one currently bound — find SG via the ai
+        for info in EXTRAS.values():
+            sgs = cmds.listConnections(info["ai"], type="shadingEngine") or []
+            for s in sgs:
+                # Match by name proximity
+                if src_blinn.replace("shader_", "").replace("_shader", "") in s:
+                    sg = s
+                    break
+            if sg:
+                break
+    if not sg:
+        cmds.warning("[mh-extras] Cannot find SG for {}".format(src_blinn))
+        return
+    _connect(src_blinn + ".outColor", sg + ".surfaceShader")
+    print("[mh-extras] Reverted '{}' -> {}".format(src_blinn, sg))
+
+
+
+def _set_shape_aiOpaque(src_blinn, opaque=False):
+    """Set aiOpaque on all shapes assigned to src_blinn's shadingEngine.
+
+    aiOpaque=False tells both Arnold (renderer) and Maya VP2 (viewport)
+    that the surface may have alpha/opacity, so the alpha is properly
+    evaluated. Without this, VP2 falls back to opaque rendering and you
+    have to use the transmission=0.001 trick to see transparency.
+    """
+    sg = _get_shadingengine(src_blinn)
+    if not sg:
+        return
+    members = cmds.sets(sg, q=True) or []
+    shapes = []
+    for m in members:
+        node = m.split(".")[0]
+        if not cmds.objExists(node):
+            continue
+        if cmds.nodeType(node) in ("mesh", "nurbsSurface"):
+            shapes.append(node)
+        else:
+            rels = cmds.listRelatives(node, s=True, ni=True,
+                                       type=("mesh", "nurbsSurface")) or []
+            shapes.extend(rels)
+    for shape in set(shapes):
+        if not cmds.attributeQuery("aiOpaque", node=shape, exists=True):
+            try:
+                cmds.addAttr(shape, longName="aiOpaque", attributeType="bool",
+                             defaultValue=True, keyable=False)
+            except Exception as e:
+                cmds.warning("[mh-extras] Could not addAttr aiOpaque on {}: {}".format(shape, e))
+                continue
+        cmds.setAttr(shape + ".aiOpaque", 1 if opaque else 0)
+        print("[mh-extras] Set aiOpaque={} on {}".format(int(bool(opaque)), shape))
+
+
+def _cleanup_orphan_helpers():
+    """Remove utility nodes left from previous (older) convert attempts so
+    Hypershade stays clean."""
+    candidates = [
+        "eyelashes_opacity_invert",
+        "eyelashesShadow_opacity_invert",
+        "Eyelashes_remapAlpha",
+        "eyelashes_remapAlpha",
+    ]
+    for n in candidates:
+        if cmds.objExists(n):
+            try:
+                cmds.delete(n)
+                print("[mh-extras] Cleaned up orphan node: {}".format(n))
+            except Exception:
+                pass
+
+
+# ============================================================================
+# PER-SHADER CONVERTERS
+# ============================================================================
+
+def convert_eyeshell():
+    """The cornea — the transparent dome that sits over the eyeball.
+    Refractive, IOR=1.376 (cornea/aqueous humor), no diffuse.
+    This shader is responsible for the realistic refraction of the iris."""
+    _ensure_arnold()
+    src = _resolve_src("eyeshell")
+    if not src:
+        cmds.warning("[mh-extras] {} not in scene.".format(EXTRAS["eyeshell"]["src"]))
+        return
+
+    ai = _create("aiStandardSurface", EXTRAS["eyeshell"]["ai"])
+    cmds.setAttr(ai + ".base",                0.0)              # no diffuse — pure clear medium
+    cmds.setAttr(ai + ".specular",            1.0)
+    cmds.setAttr(ai + ".specularRoughness",   0.05)             # very tight highlights
+    cmds.setAttr(ai + ".specularIOR",         1.376)            # cornea IOR
+    cmds.setAttr(ai + ".transmission",        1.0)              # the magic — full transmission
+    cmds.setAttr(ai + ".transmissionColor",   1.0, 1.0, 1.0, type="double3")
+    cmds.setAttr(ai + ".thinWalled",          0)                # real volume (curved dome)
+    # Cosmetic: a tiny amount of subsurface for the wet "tear film" tinting
+    cmds.setAttr(ai + ".subsurface",          0.0)
+    _override_sg(src, ai)
+    _set_shape_aiOpaque(src, opaque=False)
+    return ai
+
+
+def convert_saliva():
+    """Mouth saliva meniscus — water-like, IOR=1.33."""
+    _ensure_arnold()
+    src = _resolve_src("saliva")
+    if not src:
+        cmds.warning("[mh-extras] {} not in scene.".format(EXTRAS["saliva"]["src"]))
+        return
+
+    ai = _create("aiStandardSurface", EXTRAS["saliva"]["ai"])
+    cmds.setAttr(ai + ".base",              0.0)
+    cmds.setAttr(ai + ".specular",          1.0)
+    cmds.setAttr(ai + ".specularRoughness", 0.10)
+    cmds.setAttr(ai + ".specularIOR",       1.33)               # water IOR
+    cmds.setAttr(ai + ".transmission",      1.0)
+    cmds.setAttr(ai + ".transmissionColor", 1.0, 1.0, 1.0, type="double3")
+    cmds.setAttr(ai + ".thinWalled",        0)
+    _override_sg(src, ai)
+    _set_shape_aiOpaque(src, opaque=False)
+    return ai
+
+
+def convert_eyelashes():
+    """Lashes — opacity-mapped hair cards. Dark color, slight translucency.
+
+    The MetaHuman lashes texture (`Eyelashes_Color.png`) encodes the lash
+    silhouette directly in the RGB values (black background, colored
+    eyelash strands). So we wire the same outColor to BOTH baseColor and
+    opacity — no reverse node, no remap. Black regions = transparent."""
+    _ensure_arnold()
+    src = _resolve_src("eyelashes")
+    if not src:
+        cmds.warning("[mh-extras] {} not in scene.".format(EXTRAS["eyelashes"]["src"]))
+        return
+
+    _cleanup_orphan_helpers()
+    ai = _create("aiStandardSurface", EXTRAS["eyelashes"]["ai"])
+
+    color_src = _src_plug(src, "color")
+    if color_src:
+        # Same texture drives both color and opacity — the texture's RGB
+        # already encodes the alpha mask (black = transparent).
+        _connect(color_src, ai + ".baseColor")
+        _connect(color_src, ai + ".opacity")
+    else:
+        c = _get_color(src, "color", (0.05, 0.03, 0.02))
+        cmds.setAttr(ai + ".baseColor", c[0], c[1], c[2], type="double3")
+        # Static transparency → static opacity
+        t = _get_color(src, "transparency", (0.0, 0.0, 0.0))
+        op = (1.0 - t[0], 1.0 - t[1], 1.0 - t[2])
+        cmds.setAttr(ai + ".opacity", op[0], op[1], op[2], type="double3")
+    cmds.setAttr(ai + ".base", 1.0)
+
+    cmds.setAttr(ai + ".specular",          0.30)
+    cmds.setAttr(ai + ".specularRoughness", 0.40)
+    cmds.setAttr(ai + ".specularIOR",       1.45)
+    cmds.setAttr(ai + ".thinWalled",        1)            # cards: no volumetric SSS
+
+    _override_sg(src, ai)
+    # VP2 + Arnold: mark assigned shapes as non-opaque so opacity is evaluated
+    # without needing the transmission=0.001 hack.
+    _set_shape_aiOpaque(src, opaque=False)
+    return ai
+
+
+def convert_eyelashesShadow():
+    """Fake contact-shadow plane under the eyelashes — black with alpha.
+
+    Same approach as eyelashes: the source blinn's color file (or its
+    transparency-tied texture) encodes the alpha mask in RGB. We wire the
+    same outColor to opacity. baseColor stays black for a darkening effect."""
+    _ensure_arnold()
+    src = _resolve_src("eyelashesShadow")
+    if not src:
+        cmds.warning("[mh-extras] {} not in scene.".format(EXTRAS["eyelashesShadow"]["src"]))
+        return
+
+    _cleanup_orphan_helpers()
+    ai = _create("aiStandardSurface", EXTRAS["eyelashesShadow"]["ai"])
+    cmds.setAttr(ai + ".base",             1.0)
+    cmds.setAttr(ai + ".baseColor",        0.0, 0.0, 0.0, type="double3")
+    cmds.setAttr(ai + ".diffuseRoughness", 1.0)
+    cmds.setAttr(ai + ".specular",         0.0)
+    cmds.setAttr(ai + ".coat",             0.0)
+    cmds.setAttr(ai + ".thinWalled",       1)
+
+    # Opacity: prefer the color texture's outColor directly (luminance-encoded
+    # alpha). Fall back to transparency texture, then to static value.
+    color_src  = _src_plug(src, "color")
+    transp_src = _src_plug(src, "transparency")
+    if color_src:
+        _connect(color_src, ai + ".opacity")
+    elif transp_src:
+        _connect(transp_src, ai + ".opacity")
+    else:
+        t = _get_color(src, "transparency", (0.5, 0.5, 0.5))
+        op = (1.0 - t[0], 1.0 - t[1], 1.0 - t[2])
+        cmds.setAttr(ai + ".opacity", op[0], op[1], op[2], type="double3")
+
+    _override_sg(src, ai)
+    _set_shape_aiOpaque(src, opaque=False)
+    return ai
+
+
+def convert_eyeEdge():
+    """Wet lacrimal rim — pink flesh, glossy because wet."""
+    _ensure_arnold()
+    src = _resolve_src("eyeEdge")
+    if not src:
+        cmds.warning("[mh-extras] {} not in scene.".format(EXTRAS["eyeEdge"]["src"]))
+        return
+
+    ai = _create("aiStandardSurface", EXTRAS["eyeEdge"]["ai"])
+
+    # Diffuse: prefer connected texture, else the blinn's color, else pinkish
+    color_src = _src_plug(src, "color")
+    if color_src:
+        _connect(color_src, ai + ".baseColor")
+    else:
+        c = _get_color(src, "color", (0.65, 0.35, 0.30))
+        cmds.setAttr(ai + ".baseColor", c[0], c[1], c[2], type="double3")
+    cmds.setAttr(ai + ".base", 1.0)
+
+    # Wet flesh: SSS + glossy spec
+    cmds.setAttr(ai + ".subsurface",         0.30)
+    cmds.setAttr(ai + ".subsurfaceColor",    0.95, 0.55, 0.45, type="double3")
+    cmds.setAttr(ai + ".subsurfaceRadius",   0.40, 0.20, 0.10, type="double3")
+    cmds.setAttr(ai + ".subsurfaceScale",    0.05)             # small scatter — thin tissue
+    cmds.setAttr(ai + ".subsurfaceType",     2)                # randomwalk_v2
+
+    cmds.setAttr(ai + ".specular",           1.0)
+    cmds.setAttr(ai + ".specularRoughness",  0.20)
+    cmds.setAttr(ai + ".specularIOR",        1.376)
+    cmds.setAttr(ai + ".coat",               0.10)
+    cmds.setAttr(ai + ".coatRoughness",      0.15)
+
+    _override_sg(src, ai)
+    return ai
+
+
+# ============================================================================
+# BULK ENTRY POINTS
+# ============================================================================
+
+_CONVERTERS = {
+    "eyeshell":        convert_eyeshell,
+    "saliva":          convert_saliva,
+    "eyelashes":       convert_eyelashes,
+    "eyelashesShadow": convert_eyelashesShadow,
+    "eyeEdge":         convert_eyeEdge,
+}
+
+
+def convert(part):
+    """Convert a single extra by key (one of EXTRAS.keys())."""
+    fn = _CONVERTERS.get(part)
+    if fn is None:
+        cmds.error("[mh-extras] Unknown part: '{}'. Use one of: {}".format(
+            part, ", ".join(_CONVERTERS.keys())))
+        return None
+    return fn()
+
+
+def convert_all():
+    """Convert all 5 extras. Skips any that aren't present in the scene."""
+    print("[mh-extras] === CONVERT ALL EXTRAS ===")
+    for key in EXTRAS:
+        if _resolve_src(key):
+            convert(key)
+    print("[mh-extras] === DONE ===")
+    print("[mh-extras] TIP: for cleaner VP2 transparency, set")
+    print("              Renderer > Viewport 2.0 > options >")
+    print("              Transparency Algorithm = 'Depth Peeling'")
+
+
+def revert(part):
+    """Restore the blinn shader for one part."""
+    info = EXTRAS.get(part)
+    if not info:
+        cmds.error("[mh-extras] Unknown part: '{}'.".format(part))
+        return
+    if not _resolve_src(part):
+        cmds.warning("[mh-extras] Source blinn '{}' not found.".format(info["src"]))
+        return
+    _restore_sg(info["src"])
+    # Restore aiOpaque=True on the shape so it goes back to opaque rendering
+    _set_shape_aiOpaque(info["src"], opaque=True)
+
+
+def revert_all():
+    """Restore all 5 blinn shaders."""
+    print("[mh-extras] === REVERT ALL ===")
+    for key in EXTRAS:
+        if _resolve_src(key):
+            revert(key)
+    print("[mh-extras] === DONE ===")
+
+
+# Convenience aliases (mirror the head/body API)
+def revert_to_dx11():
+    """Alias for revert_all() to match the rest of the pipeline's API."""
+    revert_all()
+
+
+if __name__ == "__main__":
+    convert_all()

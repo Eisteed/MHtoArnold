@@ -1,0 +1,165 @@
+// =============================================================================
+// install_mh_to_arnold.mel
+// =============================================================================
+// DRAG AND DROP this file into a Maya viewport to install a shelf button
+// that opens the MetaHuman → Arnold pipeline UI.
+//
+// Requirements before installing:
+//   - All 7 Python files (mh_head_to_arnold.py, mh_body_to_arnold.py,
+//     mh_eyeLeft_to_arnold.py, mh_eyeRight_to_arnold.py, mh_teeth_to_arnold.py,
+//     mh_extras_to_arnold.py, mh_to_arnold_ui.py) must be reachable on
+//     Maya's sys.path. Either:
+//       (a) put them flat in your `scripts/` folder, or
+//       (b) put them in `scripts/MHtoArnold/` and the launcher below will
+//           auto-add that subfolder to sys.path before importing.
+//
+// What this installer does:
+//   1. Validates that mh_to_arnold_ui.py is importable.
+//   2. Creates a button on the currently active shelf labelled "MH→Arnold".
+//   3. The button executes a Python launcher snippet on click that:
+//        - adds `scripts/MHtoArnold/` to sys.path if it exists
+//        - imports/reloads the UI module
+//        - shows the window
+//
+// The button is permanent (saved in your Maya prefs) once you save the shelf.
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// onMayaDroppedPythonFile / onMayaDroppedFile callbacks
+// -----------------------------------------------------------------------------
+// Maya looks for these specific procedure names when a file is drag-dropped
+// into the viewport. We define both so it works regardless of how Maya
+// classifies our file (it should call onMayaDroppedFile for .mel).
+// -----------------------------------------------------------------------------
+
+global proc installMhToArnoldShelfButton()
+{
+    // ------------------------------------------------------------------
+    // The Python snippet that the shelf button will execute on click.
+    // ------------------------------------------------------------------
+    // Triple-quoted to keep multi-line readable; we'll escape it for MEL.
+    //
+    //     import os, sys
+    //     # Look for an MHtoArnold subfolder in any of Maya's script dirs
+    //     for d in os.environ.get('MAYA_SCRIPT_PATH', '').split(os.pathsep):
+    //         sub = os.path.join(d, 'MHtoArnold')
+    //         if os.path.isdir(sub) and sub not in sys.path:
+    //             sys.path.insert(0, sub)
+    //     try:
+    //         import importlib, mh_to_arnold_ui as _ui
+    //         importlib.reload(_ui)
+    //         _ui.show()
+    //     except ImportError as e:
+    //         import maya.cmds as cmds
+    //         cmds.confirmDialog(
+    //             title='MH → Arnold',
+    //             message=('Could not import mh_to_arnold_ui:\\n' + str(e) +
+    //                      '\\n\\nMake sure all mh_*_to_arnold.py files are in your '
+    //                      'Maya scripts folder, or in scripts/MHtoArnold/.'),
+    //             button=['OK'])
+    //
+    // Below: same code as a single MEL string. Backslashes and newlines escaped.
+
+    string $pythonCmd =
+        "import os, sys\n"
+      + "for d in os.environ.get('MAYA_SCRIPT_PATH', '').split(os.pathsep):\n"
+      + "    sub = os.path.join(d, 'MHtoArnold')\n"
+      + "    if os.path.isdir(sub) and sub not in sys.path:\n"
+      + "        sys.path.insert(0, sub)\n"
+      + "try:\n"
+      + "    import importlib, mh_to_arnold_ui as _ui\n"
+      + "    importlib.reload(_ui)\n"
+      + "    _ui.show()\n"
+      + "except ImportError as e:\n"
+      + "    import maya.cmds as cmds\n"
+      + "    cmds.confirmDialog(title='MH \\u2192 Arnold',\n"
+      + "        message='Could not import mh_to_arnold_ui:\\n' + str(e) +\n"
+      + "                '\\n\\nPut the mh_*_to_arnold.py files in your Maya '\n"
+      + "                'scripts folder or in scripts/MHtoArnold/.',\n"
+      + "        button=['OK'])\n";
+
+    // ------------------------------------------------------------------
+    // Find the currently active shelf
+    // ------------------------------------------------------------------
+    string $currentShelf = `tabLayout -q -selectTab "ShelfLayout"`;
+    if ($currentShelf == "") {
+        warning("install_mh_to_arnold: no active shelf found.");
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // If a button with the same label already exists on this shelf, remove it
+    // first so the install is idempotent (re-dropping replaces the old one).
+    // ------------------------------------------------------------------
+    string $children[] = `shelfLayout -q -ca $currentShelf`;
+    for ($child in $children) {
+        if (`shelfButton -exists $child`) {
+            string $lbl = `shelfButton -q -label $child`;
+            if ($lbl == "MH\u2192Arnold" || $lbl == "MH->Arnold") {
+                deleteUI -control $child;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Create the new shelf button
+    // ------------------------------------------------------------------
+    // Use Maya's built-in `commandButton.png` as the icon (always present).
+    // After install you can right-click the button → Edit → change Icon
+    // to a custom image.
+    setParent $currentShelf;
+    string $btn = `shelfButton
+        -annotation "Open the MetaHuman \u2192 Arnold pipeline UI"
+        -label "MH\u2192Arnold"
+        -imageOverlayLabel "MH\u2192A"
+        -overlayLabelColor 1.0 0.85 0.5
+        -overlayLabelBackColor 0.15 0.15 0.20 0.80
+        -image "commandButton.png"
+        -sourceType "python"
+        -command $pythonCmd
+        -doubleClickCommand $pythonCmd`;
+
+    // Persist the change so the button survives Maya restarts.
+    // $gShelfTopLevel is a Maya-defined global that holds the top-level
+    // shelf control name; we must declare it before using it.
+    global string $gShelfTopLevel;
+    if ($gShelfTopLevel != "") {
+        catch(`saveAllShelves $gShelfTopLevel`);
+    }
+
+    print("install_mh_to_arnold: shelf button created on '" + $currentShelf + "'.\n");
+
+    // Helpful confirmation toast
+    confirmDialog
+        -title "MH \u2192 Arnold installed"
+        -message ("A 'MH\u2192Arnold' button was added to your active shelf ('"
+                  + $currentShelf + "').\n\nClick it to launch the UI.\n\n"
+                  + "Tip: place all mh_*_to_arnold.py in your scripts folder "
+                  + "(or scripts/MHtoArnold/) before clicking.")
+        -button "OK";
+}
+
+
+// -----------------------------------------------------------------------------
+// Maya drag-and-drop entry point.
+// Maya calls onMayaDroppedFile when a .mel is drag-dropped into a viewport.
+// -----------------------------------------------------------------------------
+global proc onMayaDroppedFile(string $filePath)
+{
+    installMhToArnoldShelfButton();
+}
+
+
+// Some Maya versions call onFileDrop instead (with different signature);
+// alias for safety.
+global proc onFileDrop(string $filePath)
+{
+    installMhToArnoldShelfButton();
+}
+
+
+// -----------------------------------------------------------------------------
+// Sourcing the file directly (e.g. from script editor) also runs the install.
+// -----------------------------------------------------------------------------
+installMhToArnoldShelfButton();
