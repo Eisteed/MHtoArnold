@@ -110,6 +110,63 @@ def _src_plug(node, attr):
     return srcs[0] if srcs else None
 
 
+def _find_upstream_file(blinn_node, prefer_attrs=("color", "transparency")):
+    """Locate a file node that feeds this blinn shader.
+
+    Search order:
+      1. Direct connection on `prefer_attrs` (color, then transparency)
+      2. Walk upstream from those plugs, looking for the first `file` node
+      3. As a last resort, scan the entire upstream history of the blinn
+
+    Returns the file node name, or None if nothing found.
+    """
+    # Try preferred attributes first
+    for attr in prefer_attrs:
+        plug = _src_plug(blinn_node, attr)
+        if not plug:
+            continue
+        node = plug.split(".")[0]
+        if cmds.nodeType(node) == "file":
+            return node
+        # Walk upstream from this intermediate node
+        hist = cmds.listHistory(node, leaf=False) or []
+        for h in hist:
+            if cmds.nodeType(h) == "file":
+                return h
+    # Last resort: anything upstream of the blinn
+    hist = cmds.listHistory(blinn_node, leaf=False) or []
+    for h in hist:
+        if cmds.nodeType(h) == "file":
+            return h
+    return None
+
+
+def _find_file_by_pattern(patterns):
+    """Search ALL file nodes in the scene by node name OR fileTextureName.
+    Returns the first file node whose name or texture path contains any of
+    the (case-insensitive) patterns. Used as a last-resort fallback when a
+    blinn shader has no upstream texture (e.g. MetaHuman lashes where the
+    file node is in the scene but not wired to the blinn)."""
+    files = cmds.ls(type="file") or []
+    # Pass 1: by node name
+    for f in files:
+        lname = f.lower()
+        for p in patterns:
+            if p.lower() in lname:
+                return f
+    # Pass 2: by texture path
+    for f in files:
+        try:
+            path = cmds.getAttr(f + ".fileTextureName") or ""
+            lpath = path.lower()
+            for p in patterns:
+                if p.lower() in lpath:
+                    return f
+        except Exception:
+            continue
+    return None
+
+
 def _get_color(node, attr, default=(1.0, 1.0, 1.0)):
     """Read a color attr value (returns 3-tuple)."""
     if not cmds.objExists(node) or not cmds.attributeQuery(attr, node=node, exists=True):
@@ -160,10 +217,8 @@ def _restore_sg(src_blinn):
 def _set_shape_aiOpaque(src_blinn, opaque=False):
     """Set aiOpaque on all shapes assigned to src_blinn's shadingEngine.
 
-    aiOpaque=False tells both Arnold (renderer) and Maya VP2 (viewport)
-    that the surface may have alpha/opacity, so the alpha is properly
-    evaluated. Without this, VP2 falls back to opaque rendering and you
-    have to use the transmission=0.001 trick to see transparency.
+    aiOpaque=False tells Arnold the surface may have alpha/opacity, so the
+    alpha is properly evaluated in render.
     """
     sg = _get_shadingengine(src_blinn)
     if not sg:
@@ -192,6 +247,7 @@ def _set_shape_aiOpaque(src_blinn, opaque=False):
         print("[mh-extras] Set aiOpaque={} on {}".format(int(bool(opaque)), shape))
 
 
+
 def _cleanup_orphan_helpers():
     """Remove utility nodes left from previous (older) convert attempts so
     Hypershade stays clean."""
@@ -200,6 +256,11 @@ def _cleanup_orphan_helpers():
         "eyelashesShadow_opacity_invert",
         "Eyelashes_remapAlpha",
         "eyelashes_remapAlpha",
+        # Cleanup of older dual-shader attempt (in case scene still has them)
+        "eyelashes_viewportLambert",
+        "eyelashes_viewportLambert_to_transparency",
+        "eyelashesShadow_viewportLambert",
+        "eyelashesShadow_viewportLambert_to_transparency",
     ]
     for n in candidates:
         if cmds.objExists(n):
@@ -276,16 +337,35 @@ def convert_eyelashes():
     _cleanup_orphan_helpers()
     ai = _create("aiStandardSurface", EXTRAS["eyelashes"]["ai"])
 
-    color_src = _src_plug(src, "color")
-    if color_src:
-        # Same texture drives both color and opacity — the texture's RGB
-        # already encodes the alpha mask (black = transparent).
-        _connect(color_src, ai + ".baseColor")
-        _connect(color_src, ai + ".opacity")
+    # Find the lashes texture anywhere in the blinn's upstream history.
+    # MetaHuman wires it to .transparency (sometimes via remap/reverse helpers
+    # that we just cleaned up), not always to .color.
+    # Strategy 1: walk upstream from the blinn (works if texture is wired
+    # to .color or .transparency).
+    file_node = _find_upstream_file(src, prefer_attrs=("color", "transparency"))
+    # Strategy 2: scene-wide search by name/path. The MetaHuman lashes file
+    # is often present in the scene but disconnected from the blinn.
+    if not file_node:
+        file_node = _find_file_by_pattern(["eyelashes_color", "eyelash_color",
+                                            "eyelashes", "eyelash", "lashes"])
+        if file_node:
+            print("[mh-extras] eyelashes: found '{}' in scene (no blinn connection)".format(file_node))
+
+    # baseColor stays a flat dark value — the texture's RGB is just the
+    # alpha mask, not the actual lash color. Wiring it to baseColor would
+    # make the lashes look colored where the alpha is white.
+    c = _get_color(src, "color", (0.02, 0.02, 0.02))
+    cmds.setAttr(ai + ".baseColor", c[0], c[1], c[2], type="double3")
+
+    # Force opacity static value to (1,1,1) BEFORE connecting the texture.
+    # MtoA defaults aiStandardSurface.opacity to (0,0,0), which makes VP2 think
+    # the surface is fully transparent and falls back to opaque rendering.
+    cmds.setAttr(ai + ".opacity", 1, 1, 1, type="double3")
+    if file_node:
+        _connect(file_node + ".outColor", ai + ".opacity")
+        print("[mh-extras] eyelashes: wired {}.outColor -> opacity".format(file_node))
     else:
-        c = _get_color(src, "color", (0.05, 0.03, 0.02))
-        cmds.setAttr(ai + ".baseColor", c[0], c[1], c[2], type="double3")
-        # Static transparency → static opacity
+        cmds.warning("[mh-extras] No eyelashes texture found anywhere in scene - using static fallback.")
         t = _get_color(src, "transparency", (0.0, 0.0, 0.0))
         op = (1.0 - t[0], 1.0 - t[1], 1.0 - t[2])
         cmds.setAttr(ai + ".opacity", op[0], op[1], op[2], type="double3")
@@ -297,8 +377,6 @@ def convert_eyelashes():
     cmds.setAttr(ai + ".thinWalled",        1)            # cards: no volumetric SSS
 
     _override_sg(src, ai)
-    # VP2 + Arnold: mark assigned shapes as non-opaque so opacity is evaluated
-    # without needing the transmission=0.001 hack.
     _set_shape_aiOpaque(src, opaque=False)
     return ai
 
@@ -324,15 +402,24 @@ def convert_eyelashesShadow():
     cmds.setAttr(ai + ".coat",             0.0)
     cmds.setAttr(ai + ".thinWalled",       1)
 
-    # Opacity: prefer the color texture's outColor directly (luminance-encoded
-    # alpha). Fall back to transparency texture, then to static value.
-    color_src  = _src_plug(src, "color")
-    transp_src = _src_plug(src, "transparency")
-    if color_src:
-        _connect(color_src, ai + ".opacity")
-    elif transp_src:
-        _connect(transp_src, ai + ".opacity")
+    # Strategy 1: upstream of the blinn
+    file_node = _find_upstream_file(src, prefer_attrs=("color", "transparency"))
+    # Strategy 2: scene-wide search — try shadow-specific names first,
+    # then fall back to lashes (the shadow plane usually reuses the lashes alpha).
+    if not file_node:
+        file_node = _find_file_by_pattern(["eyelashesshadow", "lashesshadow",
+                                            "lashes_shadow", "eyelashes_shadow"])
+    if not file_node:
+        file_node = _find_file_by_pattern(["eyelashes_color", "eyelash_color",
+                                            "eyelashes", "eyelash", "lashes"])
+
+    # Force static opacity to (1,1,1) before connecting (VP2 transparency hint)
+    cmds.setAttr(ai + ".opacity", 1, 1, 1, type="double3")
+    if file_node:
+        _connect(file_node + ".outColor", ai + ".opacity")
+        print("[mh-extras] eyelashesShadow: wired {}.outColor -> opacity".format(file_node))
     else:
+        cmds.warning("[mh-extras] No lashes/shadow texture found in scene - using static fallback.")
         t = _get_color(src, "transparency", (0.5, 0.5, 0.5))
         op = (1.0 - t[0], 1.0 - t[1], 1.0 - t[2])
         cmds.setAttr(ai + ".opacity", op[0], op[1], op[2], type="double3")
